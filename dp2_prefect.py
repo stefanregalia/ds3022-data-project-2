@@ -147,7 +147,7 @@ def receive_and_parse(
 	logger.info(f"Parsed {len(parsed)} valid fragment(s) from this poll.")
 	return parsed
 
-@task(retires = 2, retry_delay_seconds = 3)
+@task(retries = 2, retry_delay_seconds = 3)
 def delete_messages(queue_url: str, receipt_handles: list[str]) -> dict:
 	logger = get_run_logger()
 	sqs = sqs_client()
@@ -159,7 +159,7 @@ def delete_messages(queue_url: str, receipt_handles: list[str]) -> dict:
 	
 	def _chunks(lst, n):
 		for i in range(0, len(lst), n):
-		yield lst[i : i + n]
+			yield lst[i : i + n]
 
 	total_deleted = 0
 	total_failed = 0
@@ -167,7 +167,7 @@ def delete_messages(queue_url: str, receipt_handles: list[str]) -> dict:
 	for batch in _chunks(receipt_handles, 10):
 		entries = [{"Id": str(i), "ReceiptHandle": rh} for i, rh in enumerate(batch)]
 		try:
-			resp = sqs.delete_message_batch(QueueUrl = queue_url, Entries = entries)
+			resp = sqs.delete_message_batch(QueueUrl=queue_url, Entries = entries)
 		except (BotoCoreError, ClientError) as e:
 
 			logger.warning(f"delete_message_batch failed: {e}")
