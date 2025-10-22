@@ -39,7 +39,7 @@ def scatter() -> str:
 @task(retries = 2, retry_delay_seconds = 3)
 def get_queue_info(queue_url: str) -> dict:
 	"""
-	This tasks fetches SQS approximate counts and returns a structured dictionary
+	This tasks fetches SQS approximate counts and returns a structured dictionary, monitoring the queue
 	"""
 
 	logger = get_run_logger() # Defining the prefect logger
@@ -80,6 +80,72 @@ def get_queue_info(queue_url: str) -> dict:
 	except (BotoCoreError, ClientError) as e:
 		logger.warning(f"Failed to get queue attributes: {e}")
 		return {"visible": 0, "not_visible": 0, "delayed": 0, "total": 0}
+
+@task
+def receive_and_parse(
+	queue_url: str, 
+	max_messages: int = 10
+	wait_seconds: int = 10
+) -> list[dict]:
+
+	logger = get_run_logger()
+	sqs = sqs_client()
+
+	try:
+		resp = sqs.receive_message(
+		QueueUrl = queue_url,
+		MaxNumberOfMessages = max_messages,
+		WaitTimeSeconds = wait_seconds,
+		MessageAttributeNames = ["All"],
+
+		)
+
+	except (BotoCoreError, ClientError) as e:
+		logger.warning(f"SQS receive_message failed: {e}")
+		return []
+
+	messages = resp.get("Messages", [])
+	if not messages:
+		logger.info("No messages available on this poll")
+		return []
+	
+	parsed: list[dict] = []
+	for m in messages:
+		msg_id = m.get("MessageId", "")
+		attrs = m.get("MessageAttributes") or {}
+		rh = m.get("ReceiptHandle")
+
+		raw_order = (attrs.get("order_no") or {}).get("StringValue")
+		word = (attrs.get("word") or {}).get("StringValue")
+
+		if raw_order is None or word is None:
+			logger.warning(
+				f"Message {msg_id} missing required attributes; skipping. attrs = {list(attrs.keys())}"
+			)
+
+			continue
+
+		try:
+			order_no = int(raw_order)
+		except ValueError:
+			logger.warning(f"Message {msg_id} has non-integer order_no='{raw_order}'; skipping.")
+			continue
+
+		if not rh:
+			logger.warning(f"Message {msg_id} missing ReceiptHandle; cannot delete later. Skipping.")
+			continue
+
+		parsed.append(
+			{
+				"message_id": msg_id,
+				"order_no": order_no,
+				"word": word,
+				"receipt_handle": rh,
+			}
+		)
+
+	logger.info(f"Parsed {len(parsed)} valid fragment(s) from this poll.")
+	return parsed
 
 # Defining our flow order to execute our tasks
 @flow
