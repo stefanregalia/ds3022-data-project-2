@@ -84,8 +84,8 @@ def get_queue_info(queue_url: str) -> dict:
 @task
 def receive_and_parse(
 	queue_url: str, 
-	max_messages: int = 10
-	wait_seconds: int = 10
+	max_messages: int = 10,
+	wait_seconds: int = 10,
 ) -> list[dict]:
 
 	logger = get_run_logger()
@@ -93,10 +93,10 @@ def receive_and_parse(
 
 	try:
 		resp = sqs.receive_message(
-		QueueUrl = queue_url,
-		MaxNumberOfMessages = max_messages,
-		WaitTimeSeconds = wait_seconds,
-		MessageAttributeNames = ["All"],
+			QueueUrl = queue_url,
+			MaxNumberOfMessages = max_messages,
+			WaitTimeSeconds = wait_seconds,
+			MessageAttributeNames = ["All"],
 
 		)
 
