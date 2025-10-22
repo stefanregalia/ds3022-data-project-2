@@ -147,6 +147,45 @@ def receive_and_parse(
 	logger.info(f"Parsed {len(parsed)} valid fragment(s) from this poll.")
 	return parsed
 
+@task(retires = 2, retry_delay_seconds = 3)
+def delete_messages(queue_url: str, receipt_handles: list[str]) -> dict:
+	logger = get_run_logger()
+	sqs = sqs_client()
+
+	if not receipt_handles:
+		logger.info("No messages to delete this round.")
+		return {"deleted": 0, "failed": 0}
+
+	
+	def _chunks(lst, n):
+		for i in range(0, len(lst), n):
+		yield lst[i : i + n]
+
+	total_deleted = 0
+	total_failed = 0
+
+	for batch in _chunks(receipt_handles, 10):
+		entries = [{"Id": str(i), "ReceiptHandle": rh} for i, rh in enumerate(batch)]
+		try:
+			resp = sqs.delete_message_batch(QueueUrl = queue_url, Entries = entries)
+		except (BotoCoreError, ClientError) as e:
+
+			logger.warning(f"delete_message_batch failed: {e}")
+			total_failed += len(entries)
+			continue
+
+		deleted = len(resp.get("Successful", []))
+		failed = len(resp.get("Failed", []))
+		total_deleted += deleted
+		total_failed += failed
+
+		if failed:
+			failed_ids = [f.get("Id") for f in resp.get("Failed", [])]
+			logger.warning(f"Batch delete partial failure. Failed Ids: {failed_ids}")
+
+	logger.info(f"Deleted {total_deleted} message(s); {total_failed} failed to delete.")
+	return {"deleted": total_deleted, "failed": total_failed}	
+
 # Defining our flow order to execute our tasks
 @flow
 def dp2():
