@@ -147,6 +147,15 @@ def receive_and_parse(
 	logger.info(f"Parsed {len(parsed)} valid fragment(s) from this poll.")
 	return parsed
 
+@task
+def persist_fragments(path: str, frags: list[dict]) -> None:
+    import json, os
+    if not frags:
+        return
+    with open(path, "a") as f:
+        for m in frags:
+            f.write(json.dumps({"order_no": m["order_no"], "word": m["word"], "message_id": m["message_id"]}) + "\n")
+
 @task(retries = 2, retry_delay_seconds = 3)
 def delete_messages(queue_url: str, receipt_handles: list[str]) -> dict:
 	logger = get_run_logger()
@@ -231,6 +240,7 @@ def dp2(target_count: int = 21):
     logger.info("All fragments collected and deleted. Ready for Task 3.")
     # Return fragments for the next step (assembly/submission in Task 3)
     return fragments
+
 
 if __name__ == "__main__":
     # quick smoke test: collect just a few fragments so you see logs immediately
