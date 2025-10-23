@@ -347,7 +347,7 @@ def dp2(target_count: int = 21):
     final_phrase = assemble_and_submit_fast(
         fragments,
         uvaid="xtm9px",
-        platform="prefect"
+        platform="prefect",
 	dry_run=True
     )	
     return final_phrase
