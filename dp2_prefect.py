@@ -230,50 +230,69 @@ def assemble_and_submit_fast(
     platform: str = "prefect",
     expected_count: int = 21,
     submit_queue_url: str = "https://sqs.us-east-1.amazonaws.com/440848399208/dp2-submit",
+    dry_run: bool = False,          # 👈 set True to preview without submitting
+    save_preview_path: str | None = "assembled_phrase.txt",
 ) -> str:
-    """
-    Most efficient Task 3: assemble phrase from in-memory fragments and submit once.
-    - Validates counts & uniqueness
-    - O(n log n) sort by order_no
-    - Single SQS send with retries baked into the client
-    """
     logger = get_run_logger()
     if not fragments:
         raise RuntimeError("No fragments provided to assemble_and_submit_fast.")
 
-    # Validate (cheap checks help catch subtle issues early)
+    # --- validation ---
     order_nos = [int(f["order_no"]) for f in fragments]
     words     = [f["word"] for f in fragments]
-    if expected_count and len(fragments) != expected_count:
-        logger.warning(f"Fragment count {len(fragments)} != expected {expected_count}. Proceeding anyway.")
-    if len(order_nos) != len(set(order_nos)):
-        raise ValueError("Duplicate order_no detected; cannot assemble a deterministic phrase.")
-    if any(w is None or w == "" for w in words):
-        raise ValueError("Empty word found in fragments; aborting.")
 
-    # Assemble (fast and deterministic)
-    ordered = sorted(fragments, key=lambda f: int(f["order_no"]))  # Timsort (O(n log n)), n=21 ~ trivial
+    if expected_count and len(fragments) != expected_count:
+        logger.warning(f"Fragment count {len(fragments)} != expected {expected_count}.")
+    dupes = [n for n in set(order_nos) if order_nos.count(n) > 1]
+    if dupes:
+        raise ValueError(f"Duplicate order_no detected: {sorted(dupes)}")
+    if any(w is None or w == "" for w in words):
+        raise ValueError("Empty word found in fragments.")
+
+    # Ensure we have 1..expected_count exactly
+    missing = sorted(set(range(1, expected_count + 1)) - set(order_nos))
+    extra   = sorted(set(order_nos) - set(range(1, expected_count + 1)))
+    if missing:
+        raise ValueError(f"Missing order numbers: {missing}")
+    if extra:
+        raise ValueError(f"Out-of-range order numbers: {extra}")
+
+    # --- assemble ---
+    ordered = sorted(fragments, key=lambda f: int(f["order_no"]))
+    # sanity: strictly increasing?
+    if any(ordered[i]["order_no"] >= ordered[i+1]["order_no"] for i in range(len(ordered)-1)):
+        raise ValueError("order_no not strictly increasing after sort.")
     phrase = " ".join(f["word"] for f in ordered).strip()
 
-    # Submit once
+    # Preview for you to verify
+    logger.info(f"ASSEMBLED PHRASE ({len(ordered)} words): {phrase}")
+    if save_preview_path:
+        try:
+            with open(save_preview_path, "w", encoding="utf-8") as fp:
+                fp.write(phrase + "\n")
+            logger.info(f"Saved preview -> {save_preview_path}")
+        except OSError as e:
+            logger.warning(f"Could not save preview file: {e}")
+
+    if dry_run:
+        logger.info("Dry run enabled: skipping submission to dp2-submit.")
+        return phrase
+
+    # --- submit once ---
     sqs = sqs_client()
     resp = sqs.send_message(
         QueueUrl=submit_queue_url,
-        MessageBody=phrase,  # body can be anything; attributes are graded
+        MessageBody=phrase,
         MessageAttributes={
             "uvaid":   {"DataType": "String", "StringValue": uvaid},
             "phrase":  {"DataType": "String", "StringValue": phrase},
             "platform":{"DataType": "String", "StringValue": platform},
         },
     )
-
     status = resp.get("ResponseMetadata", {}).get("HTTPStatusCode")
-    if status == 200:
-        logger.info("✅ Submission accepted (HTTP 200).")
-    else:
-        logger.warning(f"⚠️ Submission non-200: {resp}")
-
-    logger.info(f"Final phrase: {phrase}")
+    if status != 200:
+        raise RuntimeError(f"Submission failed (status {status}): {resp}")
+    logger.info("✅ Submission accepted (HTTP 200).")
     return phrase
 
 
@@ -329,6 +348,7 @@ def dp2(target_count: int = 21):
         fragments,
         uvaid="xtm9px",
         platform="prefect"
+	dry_run=True
     )	
     return final_phrase
 
