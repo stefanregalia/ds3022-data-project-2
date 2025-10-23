@@ -9,7 +9,8 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from pathlib import Path
 import json, os
-
+from botocore.config import Config
+from typing import List, Dict
 
 # Defining the API endpoint
 url = f"https://j9y2xa0vx0.execute-api.us-east-1.amazonaws.com/api/scatter/xtm9px"
@@ -222,6 +223,60 @@ def delete_messages(queue_url: str, receipt_handles: list[str]) -> dict:
 	logger.info(f"Deleted {total_deleted} message(s); {total_failed} failed to delete.")
 	return {"deleted": total_deleted, "failed": total_failed}	
 
+@task(retries=2, retry_delay_seconds=3)
+def assemble_and_submit_fast(
+    fragments: List[Dict],
+    uvaid: str,
+    platform: str = "prefect",
+    expected_count: int = 21,
+    submit_queue_url: str = "https://sqs.us-east-1.amazonaws.com/440848399208/dp2-submit",
+) -> str:
+    """
+    Most efficient Task 3: assemble phrase from in-memory fragments and submit once.
+    - Validates counts & uniqueness
+    - O(n log n) sort by order_no
+    - Single SQS send with retries baked into the client
+    """
+    logger = get_run_logger()
+    if not fragments:
+        raise RuntimeError("No fragments provided to assemble_and_submit_fast.")
+
+    # Validate (cheap checks help catch subtle issues early)
+    order_nos = [int(f["order_no"]) for f in fragments]
+    words     = [f["word"] for f in fragments]
+    if expected_count and len(fragments) != expected_count:
+        logger.warning(f"Fragment count {len(fragments)} != expected {expected_count}. Proceeding anyway.")
+    if len(order_nos) != len(set(order_nos)):
+        raise ValueError("Duplicate order_no detected; cannot assemble a deterministic phrase.")
+    if any(w is None or w == "" for w in words):
+        raise ValueError("Empty word found in fragments; aborting.")
+
+    # Assemble (fast and deterministic)
+    ordered = sorted(fragments, key=lambda f: int(f["order_no"]))  # Timsort (O(n log n)), n=21 ~ trivial
+    phrase = " ".join(f["word"] for f in ordered).strip()
+
+    # Submit once
+    sqs = sqs_client()
+    resp = sqs.send_message(
+        QueueUrl=submit_queue_url,
+        MessageBody=phrase,  # body can be anything; attributes are graded
+        MessageAttributes={
+            "uvaid":   {"DataType": "String", "StringValue": uvaid},
+            "phrase":  {"DataType": "String", "StringValue": phrase},
+            "platform":{"DataType": "String", "StringValue": platform},
+        },
+    )
+
+    status = resp.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    if status == 200:
+        logger.info("✅ Submission accepted (HTTP 200).")
+    else:
+        logger.warning(f"⚠️ Submission non-200: {resp}")
+
+    logger.info(f"Final phrase: {phrase}")
+    return phrase
+
+
 # Defining our flow order to execute our tasks
 @flow
 def dp2(target_count: int = 21):
@@ -270,8 +325,12 @@ def dp2(target_count: int = 21):
 
 
     logger.info("All fragments collected and deleted. Ready for Task 3.")
-    # Return fragments for the next step (assembly/submission in Task 3)
-    return fragments
+    final_phrase = assemble_and_submit_fast(
+        fragments,
+        uvaid="xtm9px",
+        platform="prefect"
+    )	
+    return final_phrase
 
 
 if __name__ == "__main__":
