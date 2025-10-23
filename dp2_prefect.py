@@ -296,6 +296,9 @@ def assemble_and_submit_fast(
 
 
 # Defining our flow order to execute our tasks
+import time
+from prefect import flow, get_run_logger
+
 @flow
 def dp2(target_count: int = 21):
     logger = get_run_logger()
@@ -304,68 +307,70 @@ def dp2(target_count: int = 21):
     by_order: dict[int, dict] = {}
     seen_ids: set[str] = set()
 
+    # time guards
+    MAX_WAIT_SECS = 20 * 60   # absolute wall-clock cap after scatter()
+    IDLE_SECS     = 4 * 60    # no new unique fragment for this long => give up
+
+    start = time.monotonic()
+    last_new_at = start
+
     logger.info(f"Starting collection loop; aiming for {target_count} unique fragments.")
 
-	consecutive_empty = 0
-	EMPTY_LIMIT = 3
+    while len(by_order) < target_count:
+        # hard deadline
+        if time.monotonic() - start > MAX_WAIT_SECS:
+            logger.warning("Max wait exceeded; breaking out of loop.")
+            break
+        # idle timeout (no progress)
+        if time.monotonic() - last_new_at > IDLE_SECS:
+            logger.warning("Idle timeout (no new unique fragments); breaking out of loop.")
+            break
 
-	while len(by_order) < target_count:
-    	stats = get_queue_info(queue_url)
-    	logger.info(f"Queue snapshot before poll: {stats}")
+        # Observability only (approximate)
+        stats = get_queue_info(queue_url)
+        logger.info(f"Queue snapshot before poll: {stats}")
 
-    	if stats["total"] == 0:
-        	consecutive_empty += 1
-    	else:
-        	consecutive_empty = 0
+        # Long-poll receive (WaitTimeSeconds=10 inside)
+        batch = receive_and_parse(queue_url)
+        if not batch:
+            continue
 
-    	batch = receive_and_parse(queue_url)
-    	if not batch:
-        	if consecutive_empty >= EMPTY_LIMIT:
-            	logger.info("Queue has been empty for several polls; exiting collect loop.")
-            	break
-        	continue
-
-    	consecutive_empty = 0  # we did receive
-
-
-        # Filter out already-seen MessageIds (SQS redelivery defense)
+        # Dedup by MessageId (defense vs redelivery)
         new_msgs = [m for m in batch if m["message_id"] not in seen_ids]
         for m in new_msgs:
             seen_ids.add(m["message_id"])
 
-        # Persist everything we just received (durable before delete)
+        # Persist before delete (rubric)
         persist_fragments("runs/dp2_fragments.jsonl", new_msgs)
 
-        # Keep only the FIRST message for a given order_no
+        # Keep first per order_no
         added = 0
         for m in new_msgs:
             o = m["order_no"]
             if o not in by_order:
                 by_order[o] = m
                 added += 1
-            else:
-                logger.info(f"Duplicate order_no {o} encountered; keeping the first one already stored.")
 
-        # IMPORTANT: delete EVERYTHING we polled so no dangles (not just new_msgs)
+        # Delete EVERYTHING we polled so no dangles
         rhandles = [m["receipt_handle"] for m in batch]
         delete_messages(queue_url, rhandles)
 
+        if added:
+            last_new_at = time.monotonic()
         logger.info(f"Collected {len(by_order)} unique / {target_count} required. (+{added} this round)")
-
 
     logger.info("Collection loop ended. Proceeding to validation/assembly.")
 
     fragments = list(by_order.values())
-
-    # Give assemble step the target so it can tell you what’s missing
     final_phrase = assemble_and_submit_fast(
         fragments,
         uvaid="xtm9px",
         platform="prefect",
         expected_count=target_count,
-        dry_run=True,  # flip to False to submit
+        dry_run=True,  # flip to False to actually submit
     )
     return final_phrase
+
 
 
 if __name__ == "__main__":
