@@ -167,7 +167,7 @@ def delete_messages(queue_url: str, receipt_handles: list[str]) -> dict:
 	for batch in _chunks(receipt_handles, 10):
 		entries = [{"Id": str(i), "ReceiptHandle": rh} for i, rh in enumerate(batch)]
 		try:
-			resp = sqs.delete_message_batch(QueueUrl=queue_url, Entries = entries)
+			resp = sqs.delete_message_batch(QueueUrl=queue_url, Entries=entries)
 		except (BotoCoreError, ClientError) as e:
 
 			logger.warning(f"delete_message_batch failed: {e}")
@@ -188,10 +188,47 @@ def delete_messages(queue_url: str, receipt_handles: list[str]) -> dict:
 
 # Defining our flow order to execute our tasks
 @flow
-def dp2():
-	qurl = scatter() # Running our scatter task
-	return qurl 
+def dp2(target_count: int = 21):
+    logger = get_run_logger()
 
-# Running the script
-if __name__ == "__main__":
-	dp2()
+    # 1) Populate/reset the queue (Task 1). Run once per end-to-end attempt.
+    queue_url = scatter()
+
+    # 2) Accumulate parsed fragments here across multiple polls
+    fragments: list[dict] = []
+    seen_ids: set[str] = set()  # defensive dedup if SQS redelivers
+
+    logger.info(f"Starting collection loop; aiming for {target_count} fragments.")
+
+    # 3) Loop until we’ve received and deleted everything
+    while len(fragments) < target_count:
+        # (optional) Observability: check counts so logs show progress
+        stats = get_queue_info(queue_url)
+        logger.info(f"Queue snapshot before poll: {stats}")
+
+        # Receive and parse up to 10 messages once (long polling inside)
+        batch = receive_and_parse(queue_url)
+
+        if not batch:
+            # Nothing visible yet (likely delayed/invisible); try again
+            # (Long polling already waited; no need for extra sleep)
+            continue
+
+        # Keep only truly new messages (if any dup deliveries occur)
+        new_batch = [m for m in batch if m["message_id"] not in seen_ids]
+        for m in new_batch:
+            seen_ids.add(m["message_id"])
+
+        # Store fragments for Task 3 (order_no + word kept in each dict)
+        fragments.extend(new_batch)
+
+        # Delete what we just stored so we don’t leave dangling messages
+        rhandles = [m["receipt_handle"] for m in new_batch]
+        delete_messages(queue_url, rhandles)
+
+        logger.info(f"Collected {len(fragments)} / {target_count} so far.")
+
+    logger.info("All fragments collected and deleted. Ready for Task 3.")
+    # Return fragments for the next step (assembly/submission in Task 3)
+    return fragments
+
