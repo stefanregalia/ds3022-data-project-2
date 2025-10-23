@@ -264,7 +264,7 @@ def dp2(target_count: int = 21):
 		rhandles = [m["receipt_handle"] for m in new_batch]
 		delete_messages(queue_url, rhandles)
 
-        	logger.info(f"Collected {len(fragments)} / {target_count} so far.")
+        logger.info(f"Collected {len(fragments)} / {target_count} so far.")
 
     logger.info("All fragments collected and deleted. Ready for Task 3.")
     # Return fragments for the next step (assembly/submission in Task 3)
