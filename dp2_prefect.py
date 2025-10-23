@@ -229,28 +229,31 @@ def assemble_and_submit_fast(
     platform: str = "prefect",
     expected_count: int = 21,
     submit_queue_url: str = "https://sqs.us-east-1.amazonaws.com/440848399208/dp2-submit",
-    dry_run: bool = False,          # 👈 set True to preview without submitting
+    dry_run: bool = False,                 # set True to preview without submitting
     save_preview_path: str | None = "assembled_phrase.txt",
 ) -> str:
     logger = get_run_logger()
     if not fragments:
         raise RuntimeError("No fragments provided to assemble_and_submit_fast.")
 
-    # --- validation ---
+    # --- validation (accepts 0..20 or 1..21) ---
     order_nos = [int(f["order_no"]) for f in fragments]
     words     = [f["word"] for f in fragments]
 
     if expected_count and len(fragments) != expected_count:
         logger.warning(f"Fragment count {len(fragments)} != expected {expected_count}.")
+
     dupes = [n for n in set(order_nos) if order_nos.count(n) > 1]
     if dupes:
         raise ValueError(f"Duplicate order_no detected: {sorted(dupes)}")
     if any(w is None or w == "" for w in words):
         raise ValueError("Empty word found in fragments.")
 
-    # Ensure we have 1..expected_count exactly
-    missing = sorted(set(range(1, expected_count + 1)) - set(order_nos))
-    extra   = sorted(set(order_nos) - set(range(1, expected_count + 1)))
+    # Require any contiguous block of length expected_count (0- or 1-based)
+    mn = min(order_nos)
+    required = set(range(mn, mn + expected_count))
+    missing = sorted(required - set(order_nos))
+    extra   = sorted(set(order_nos) - required)
     if missing:
         raise ValueError(f"Missing order numbers: {missing}")
     if extra:
@@ -263,7 +266,7 @@ def assemble_and_submit_fast(
         raise ValueError("order_no not strictly increasing after sort.")
     phrase = " ".join(f["word"] for f in ordered).strip()
 
-    # Preview for you to verify
+    # Preview/logging
     logger.info(f"ASSEMBLED PHRASE ({len(ordered)} words): {phrase}")
     if save_preview_path:
         try:
@@ -294,10 +297,26 @@ def assemble_and_submit_fast(
     logger.info("✅ Submission accepted (HTTP 200).")
     return phrase
 
+    # --- submit once ---
+    sqs = sqs_client()
+    resp = sqs.send_message(
+        QueueUrl=submit_queue_url,
+        MessageBody=phrase,
+        MessageAttributes={
+            "uvaid":   {"DataType": "String", "StringValue": uvaid},
+            "phrase":  {"DataType": "String", "StringValue": phrase},
+            "platform":{"DataType": "String", "StringValue": platform},
+        },
+    )
+    status = resp.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    if status != 200:
+        raise RuntimeError(f"Submission failed (status {status}): {resp}")
+    logger.info("✅ Submission accepted (HTTP 200).")
+    return phrase
+
 
 # Defining our flow order to execute our tasks
 import time
-from prefect import flow, get_run_logger
 
 @flow
 def dp2(target_count: int = 21):
@@ -307,40 +326,52 @@ def dp2(target_count: int = 21):
     by_order: dict[int, dict] = {}
     seen_ids: set[str] = set()
 
-    # time guards
-    MAX_WAIT_SECS = 20 * 60   # absolute wall-clock cap after scatter()
-    IDLE_SECS     = 4 * 60    # no new unique fragment for this long => give up
-
-    start = time.monotonic()
-    last_new_at = start
+    # Stall detector config: how many consecutive “empty queue” snapshots before we bail
+    CONSECUTIVE_EMPTY_LIMIT = 5
+    consecutive_empty = 0
 
     logger.info(f"Starting collection loop; aiming for {target_count} unique fragments.")
 
     while len(by_order) < target_count:
-        # hard deadline
-        if time.monotonic() - start > MAX_WAIT_SECS:
-            logger.warning("Max wait exceeded; breaking out of loop.")
-            break
-        # idle timeout (no progress)
-        if time.monotonic() - last_new_at > IDLE_SECS:
-            logger.warning("Idle timeout (no new unique fragments); breaking out of loop.")
-            break
-
-        # Observability only (approximate)
+        # Observability snapshot
         stats = get_queue_info(queue_url)
         logger.info(f"Queue snapshot before poll: {stats}")
 
-        # Long-poll receive (WaitTimeSeconds=10 inside)
+        # Long-poll receive (WaitTimeSeconds=10 inside receive_and_parse)
         batch = receive_and_parse(queue_url)
+
         if not batch:
+            # If broker says nothing is visible, not-visible, or delayed, count toward stall
+            if stats["visible"] == 0 and stats["not_visible"] == 0 and stats["delayed"] == 0:
+                consecutive_empty += 1
+                logger.info(f"Empty-queue snapshot {consecutive_empty}/{CONSECUTIVE_EMPTY_LIMIT}.")
+                if consecutive_empty >= CONSECUTIVE_EMPTY_LIMIT:
+                    have = sorted(m["order_no"] for m in by_order.values())
+                    if have:
+                        mn = min(have)
+                        required = set(range(mn, mn + target_count))
+                        missing = sorted(required - set(have))
+                    else:
+                        # fallback if we literally have nothing yet
+                        missing = list(range(1, target_count + 1))
+                    raise RuntimeError(
+                        f"Stall detected: queue empty for {CONSECUTIVE_EMPTY_LIMIT} consecutive polls, "
+                        f"but only collected {len(by_order)}/{target_count}. Missing order numbers: {missing}"
+                    )
+            else:
+                # There’s backlog somewhere (delayed or in-flight); reset stall counter
+                consecutive_empty = 0
             continue
+
+        # We received a batch -> reset stall counter
+        consecutive_empty = 0
 
         # Dedup by MessageId (defense vs redelivery)
         new_msgs = [m for m in batch if m["message_id"] not in seen_ids]
         for m in new_msgs:
             seen_ids.add(m["message_id"])
 
-        # Persist before delete (rubric)
+        # Persist before delete (per rubric)
         persist_fragments("runs/dp2_fragments.jsonl", new_msgs)
 
         # Keep first per order_no
@@ -352,14 +383,12 @@ def dp2(target_count: int = 21):
                 added += 1
 
         # Delete EVERYTHING we polled so no dangles
-        rhandles = [m["receipt_handle"] for m in batch]
-        delete_messages(queue_url, rhandles)
+        delete_messages(queue_url, [m["receipt_handle"] for m in batch])
 
         if added:
-            last_new_at = time.monotonic()
-        logger.info(f"Collected {len(by_order)} unique / {target_count} required. (+{added} this round)")
+            logger.info(f"Collected {len(by_order)} unique / {target_count} required. (+{added} this round)")
 
-    logger.info("Collection loop ended. Proceeding to validation/assembly.")
+    logger.info("Collected all required fragments; proceeding to validation/assembly.")
 
     fragments = list(by_order.values())
     final_phrase = assemble_and_submit_fast(
@@ -367,9 +396,11 @@ def dp2(target_count: int = 21):
         uvaid="xtm9px",
         platform="prefect",
         expected_count=target_count,
-        dry_run=True,  # flip to False to actually submit
+        dry_run=True,  # set to False when you're ready to actually submit
     )
     return final_phrase
+
+
 
 
 
