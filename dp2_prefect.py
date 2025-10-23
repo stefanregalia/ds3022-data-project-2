@@ -9,7 +9,6 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from pathlib import Path
 import json, os
-from botocore.config import Config
 from typing import List, Dict
 
 # Defining the API endpoint
@@ -305,50 +304,28 @@ def dp2(target_count: int = 21):
     by_order: dict[int, dict] = {}
     seen_ids: set[str] = set()
 
-    # new: guardrails
-    consecutive_empty = 0
-    EMPTY_LIMIT = 3          # e.g., 3 consecutive empty snapshots
-    MAX_SECS = 20 * 60       # hard runtime cap (20 min) – optional
-
-    import time
-    start = time.monotonic()
-
     logger.info(f"Starting collection loop; aiming for {target_count} unique fragments.")
 
     while len(by_order) < target_count:
-        # optional global timeout
-        if time.monotonic() - start > MAX_SECS:
-            logger.warning("Max wait exceeded; breaking out of loop.")
-            break
-
+        # Observe the queue (for logs / visibility only)
         stats = get_queue_info(queue_url)
         logger.info(f"Queue snapshot before poll: {stats}")
 
-        # queue appears empty?
-        if stats["total"] == 0:
-            consecutive_empty += 1
-        else:
-            consecutive_empty = 0
-
+        # Long-poll for messages (WaitTimeSeconds=10 inside receive_and_parse)
         batch = receive_and_parse(queue_url)
         if not batch:
-            # if we've seen several empty snapshots in a row, exit
-            if consecutive_empty >= EMPTY_LIMIT:
-                logger.info("Queue has been empty for several polls; exiting collect loop.")
-                break
+            # Nothing visible yet — keep polling until all 21 arrive
             continue
 
-        consecutive_empty = 0  # we saw messages
-
-        # filter out already-seen ids
+        # Filter out already-seen MessageIds (SQS redelivery defense)
         new_msgs = [m for m in batch if m["message_id"] not in seen_ids]
         for m in new_msgs:
             seen_ids.add(m["message_id"])
 
-        # persist everything we polled (durable)
+        # Persist everything we just received (durable before delete)
         persist_fragments("runs/dp2_fragments.jsonl", new_msgs)
 
-        # keep first per order_no
+        # Keep only the FIRST message for a given order_no
         added = 0
         for m in new_msgs:
             o = m["order_no"]
@@ -363,6 +340,7 @@ def dp2(target_count: int = 21):
         delete_messages(queue_url, rhandles)
 
         logger.info(f"Collected {len(by_order)} unique / {target_count} required. (+{added} this round)")
+
 
     logger.info("Collection loop ended. Proceeding to validation/assembly.")
 
