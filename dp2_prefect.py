@@ -237,6 +237,7 @@ def dp2(target_count: int = 21):
     logger.info(f"Starting collection loop; aiming for {target_count} fragments.")
 
     # 3) Loop until we’ve received and deleted everything
+        # 3) Loop until we’ve received and deleted everything
     while len(fragments) < target_count:
         # (optional) Observability: check counts so logs show progress
         stats = get_queue_info(queue_url)
@@ -255,16 +256,18 @@ def dp2(target_count: int = 21):
         for m in new_batch:
             seen_ids.add(m["message_id"])
 
+        # Keep in-memory for Task 3
         fragments.extend(new_batch)
 
-# NEW: persist to durable storage BEFORE deletion (rubric: “persistently stores parsed content”)
-		persist_fragments("runs/dp2_fragments.jsonl", new_batch)
+        # ✅ Persist to durable storage BEFORE deletion (rubric)
+        persist_fragments("runs/dp2_fragments.jsonl", new_batch)
 
-# Now safe to delete what we just persisted
-		rhandles = [m["receipt_handle"] for m in new_batch]
-		delete_messages(queue_url, rhandles)
+        # Now safe to delete what we just persisted
+        rhandles = [m["receipt_handle"] for m in new_batch]
+        delete_messages(queue_url, rhandles)
 
         logger.info(f"Collected {len(fragments)} / {target_count} so far.")
+
 
     logger.info("All fragments collected and deleted. Ready for Task 3.")
     # Return fragments for the next step (assembly/submission in Task 3)
