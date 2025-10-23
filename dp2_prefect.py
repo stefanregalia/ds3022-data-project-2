@@ -88,7 +88,7 @@ def get_queue_info(queue_url: str) -> dict:
 def receive_and_parse(
 	queue_url: str, 
 	max_messages: int = 10,
-	wait_seconds: int = 10,
+	wait_seconds: int = 10,  # ⚠️ CHANGED BACK TO 10!
 ) -> list[dict]:
 
 	logger = get_run_logger()
@@ -100,9 +100,7 @@ def receive_and_parse(
 			MaxNumberOfMessages = max_messages,
 			WaitTimeSeconds = wait_seconds,
 			MessageAttributeNames = ["All"],
-
 		)
-
 	except (BotoCoreError, ClientError) as e:
 		logger.warning(f"SQS receive_message failed: {e}")
 		return []
@@ -112,42 +110,90 @@ def receive_and_parse(
 		logger.info("No messages available on this poll")
 		return []
 	
+	logger.info(f"📨 Received {len(messages)} message(s) from SQS. Beginning parse.")
+	
 	parsed: list[dict] = []
 	for m in messages:
-		msg_id = m.get("MessageId", "")
-		attrs = m.get("MessageAttributes") or {}
-		rh = m.get("ReceiptHandle")
-
-		raw_order = (attrs.get("order_no") or {}).get("StringValue")
-		word = (attrs.get("word") or {}).get("StringValue")
-
-		if raw_order is None or word is None:
-			logger.warning(
-				f"Message {msg_id} missing required attributes; skipping. attrs = {list(attrs.keys())}"
-			)
-
-			continue
-
+		msg_id = m.get("MessageId", "UNKNOWN")
+		
 		try:
-			order_no = int(raw_order)
-		except ValueError:
-			logger.warning(f"Message {msg_id} has non-integer order_no='{raw_order}'; skipping.")
+			attrs = m.get("MessageAttributes")
+			logger.info(f"📋 Message {msg_id[:8]}... attrs type: {type(attrs)}")  # Changed to INFO
+			
+			if attrs is None:
+				logger.warning(f"⚠️ Message {msg_id} has MessageAttributes = None")
+				continue
+			
+			if not isinstance(attrs, dict):
+				logger.warning(f"⚠️ Message {msg_id} has MessageAttributes of wrong type: {type(attrs)}")
+				continue
+			
+			rh = m.get("ReceiptHandle")
+
+			order_attr = attrs.get("order_no")
+			word_attr = attrs.get("word")
+			
+			logger.info(f"📋 Message {msg_id[:8]}... order_attr type: {type(order_attr)}, word_attr type: {type(word_attr)}")  # Changed to INFO
+			
+			if order_attr is None:
+				logger.warning(f"⚠️ Message {msg_id} missing 'order_no' attribute. Available: {list(attrs.keys())}")
+				continue
+			
+			if word_attr is None:
+				logger.warning(f"⚠️ Message {msg_id} missing 'word' attribute. Available: {list(attrs.keys())}")
+				continue
+			
+			# Extract StringValue safely
+			if isinstance(order_attr, dict):
+				raw_order = order_attr.get("StringValue")
+			elif isinstance(order_attr, str):
+				logger.warning(f"⚠️ Message {msg_id} has order_no as plain string: '{order_attr}' (expected dict)")
+				raw_order = order_attr
+			else:
+				logger.warning(f"⚠️ Message {msg_id} has order_no of unexpected type: {type(order_attr)}")
+				continue
+			
+			if isinstance(word_attr, dict):
+				word = word_attr.get("StringValue")
+			elif isinstance(word_attr, str):
+				logger.warning(f"⚠️ Message {msg_id} has word as plain string: '{word_attr}' (expected dict)")
+				word = word_attr
+			else:
+				logger.warning(f"⚠️ Message {msg_id} has word of unexpected type: {type(word_attr)}")
+				continue
+
+			if raw_order is None or word is None:
+				logger.warning(
+					f"⚠️ Message {msg_id} missing StringValue. order_no={order_attr}, word={word_attr}"
+				)
+				continue
+
+			try:
+				order_no = int(raw_order)
+			except (ValueError, TypeError) as e:
+				logger.warning(f"⚠️ Message {msg_id} has non-integer order_no='{raw_order}': {e}")
+				continue
+
+			if not rh:
+				logger.warning(f"⚠️ Message {msg_id} missing ReceiptHandle")
+				continue
+
+			parsed.append(
+				{
+					"message_id": msg_id,
+					"order_no": order_no,
+					"word": word,
+					"receipt_handle": rh,
+				}
+			)
+			logger.info(f"✅ Parsed message {msg_id[:8]}... order_no={order_no}, word='{word}'")  # Changed to INFO
+			
+		except Exception as e:
+			logger.error(f"🔥 UNEXPECTED ERROR parsing message {msg_id}: {type(e).__name__}: {e}")
+			logger.error(f"Message structure: {m}")
 			continue
 
-		if not rh:
-			logger.warning(f"Message {msg_id} missing ReceiptHandle; cannot delete later. Skipping.")
-			continue
-
-		parsed.append(
-			{
-				"message_id": msg_id,
-				"order_no": order_no,
-				"word": word,
-				"receipt_handle": rh,
-			}
-		)
-
-	logger.info(f"Parsed {len(parsed)} valid fragment(s) from this poll.")
+	logger.info(f"✅ Parsed {len(parsed)} valid fragment(s) from {len(messages)} received.")
 	return parsed
 
 @task
