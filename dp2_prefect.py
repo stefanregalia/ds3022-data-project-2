@@ -302,29 +302,53 @@ def dp2(target_count: int = 21):
     logger = get_run_logger()
     queue_url = scatter()
 
-    # Track uniqueness by order_no AND seen MessageIds to avoid double counting
     by_order: dict[int, dict] = {}
     seen_ids: set[str] = set()
+
+    # new: guardrails
+    consecutive_empty = 0
+    EMPTY_LIMIT = 3          # e.g., 3 consecutive empty snapshots
+    MAX_SECS = 20 * 60       # hard runtime cap (20 min) – optional
+
+    import time
+    start = time.monotonic()
 
     logger.info(f"Starting collection loop; aiming for {target_count} unique fragments.")
 
     while len(by_order) < target_count:
+        # optional global timeout
+        if time.monotonic() - start > MAX_SECS:
+            logger.warning("Max wait exceeded; breaking out of loop.")
+            break
+
         stats = get_queue_info(queue_url)
         logger.info(f"Queue snapshot before poll: {stats}")
 
+        # queue appears empty?
+        if stats["total"] == 0:
+            consecutive_empty += 1
+        else:
+            consecutive_empty = 0
+
         batch = receive_and_parse(queue_url)
         if not batch:
+            # if we've seen several empty snapshots in a row, exit
+            if consecutive_empty >= EMPTY_LIMIT:
+                logger.info("Queue has been empty for several polls; exiting collect loop.")
+                break
             continue
 
-        # Filter out already-seen MessageIds (SQS redelivery defense)
+        consecutive_empty = 0  # we saw messages
+
+        # filter out already-seen ids
         new_msgs = [m for m in batch if m["message_id"] not in seen_ids]
         for m in new_msgs:
             seen_ids.add(m["message_id"])
 
-        # Persist everything we received (for durability)
+        # persist everything we polled (durable)
         persist_fragments("runs/dp2_fragments.jsonl", new_msgs)
 
-        # Incorporate only the FIRST message for a given order_no
+        # keep first per order_no
         added = 0
         for m in new_msgs:
             o = m["order_no"]
@@ -334,22 +358,23 @@ def dp2(target_count: int = 21):
             else:
                 logger.info(f"Duplicate order_no {o} encountered; keeping the first one already stored.")
 
-        # Always delete what we polled (even duplicates) to leave no dangles
-        rhandles = [m["receipt_handle"] for m in new_msgs]
+        # IMPORTANT: delete EVERYTHING we polled so no dangles (not just new_msgs)
+        rhandles = [m["receipt_handle"] for m in batch]
         delete_messages(queue_url, rhandles)
 
         logger.info(f"Collected {len(by_order)} unique / {target_count} required. (+{added} this round)")
 
-    logger.info("All unique fragments collected and deleted. Ready for Task 3.")
+    logger.info("Collection loop ended. Proceeding to validation/assembly.")
 
-    # Convert the dict to a list for assembly
     fragments = list(by_order.values())
 
+    # Give assemble step the target so it can tell you what’s missing
     final_phrase = assemble_and_submit_fast(
         fragments,
         uvaid="xtm9px",
         platform="prefect",
-        dry_run=True,  # flip to False to actually submit
+        expected_count=target_count,
+        dry_run=True,  # flip to False to submit
     )
     return final_phrase
 
