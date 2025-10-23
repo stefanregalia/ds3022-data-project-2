@@ -300,56 +300,57 @@ def assemble_and_submit_fast(
 @flow
 def dp2(target_count: int = 21):
     logger = get_run_logger()
-
-    # 1) Populate/reset the queue (Task 1). Run once per end-to-end attempt.
     queue_url = scatter()
 
-    # 2) Accumulate parsed fragments here across multiple polls
-    fragments: list[dict] = []
-    seen_ids: set[str] = set()  # defensive dedup if SQS redelivers
+    # Track uniqueness by order_no AND seen MessageIds to avoid double counting
+    by_order: dict[int, dict] = {}
+    seen_ids: set[str] = set()
 
-    logger.info(f"Starting collection loop; aiming for {target_count} fragments.")
+    logger.info(f"Starting collection loop; aiming for {target_count} unique fragments.")
 
-    # 3) Loop until we’ve received and deleted everything
-        # 3) Loop until we’ve received and deleted everything
-    while len(fragments) < target_count:
-        # (optional) Observability: check counts so logs show progress
+    while len(by_order) < target_count:
         stats = get_queue_info(queue_url)
         logger.info(f"Queue snapshot before poll: {stats}")
 
-        # Receive and parse up to 10 messages once (long polling inside)
         batch = receive_and_parse(queue_url)
-
         if not batch:
-            # Nothing visible yet (likely delayed/invisible); try again
-            # (Long polling already waited; no need for extra sleep)
             continue
 
-        # Keep only truly new messages (if any dup deliveries occur)
-        new_batch = [m for m in batch if m["message_id"] not in seen_ids]
-        for m in new_batch:
+        # Filter out already-seen MessageIds (SQS redelivery defense)
+        new_msgs = [m for m in batch if m["message_id"] not in seen_ids]
+        for m in new_msgs:
             seen_ids.add(m["message_id"])
 
-        # Keep in-memory for Task 3
-        fragments.extend(new_batch)
+        # Persist everything we received (for durability)
+        persist_fragments("runs/dp2_fragments.jsonl", new_msgs)
 
-        # ✅ Persist to durable storage BEFORE deletion (rubric)
-        persist_fragments("runs/dp2_fragments.jsonl", new_batch)
+        # Incorporate only the FIRST message for a given order_no
+        added = 0
+        for m in new_msgs:
+            o = m["order_no"]
+            if o not in by_order:
+                by_order[o] = m
+                added += 1
+            else:
+                logger.info(f"Duplicate order_no {o} encountered; keeping the first one already stored.")
 
-        # Now safe to delete what we just persisted
-        rhandles = [m["receipt_handle"] for m in new_batch]
+        # Always delete what we polled (even duplicates) to leave no dangles
+        rhandles = [m["receipt_handle"] for m in new_msgs]
         delete_messages(queue_url, rhandles)
 
-        logger.info(f"Collected {len(fragments)} / {target_count} so far.")
+        logger.info(f"Collected {len(by_order)} unique / {target_count} required. (+{added} this round)")
 
+    logger.info("All unique fragments collected and deleted. Ready for Task 3.")
 
-    logger.info("All fragments collected and deleted. Ready for Task 3.")
+    # Convert the dict to a list for assembly
+    fragments = list(by_order.values())
+
     final_phrase = assemble_and_submit_fast(
         fragments,
         uvaid="xtm9px",
         platform="prefect",
-	dry_run=True
-    )	
+        dry_run=True,  # flip to False to actually submit
+    )
     return final_phrase
 
 
