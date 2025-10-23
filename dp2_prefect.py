@@ -232,3 +232,6 @@ def dp2(target_count: int = 21):
     # Return fragments for the next step (assembly/submission in Task 3)
     return fragments
 
+if __name__ == "__main__":
+    # quick smoke test: collect just a few fragments so you see logs immediately
+    dp2()
