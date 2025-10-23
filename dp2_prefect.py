@@ -306,16 +306,27 @@ def dp2(target_count: int = 21):
 
     logger.info(f"Starting collection loop; aiming for {target_count} unique fragments.")
 
-    while len(by_order) < target_count:
-        # Observe the queue (for logs / visibility only)
-        stats = get_queue_info(queue_url)
-        logger.info(f"Queue snapshot before poll: {stats}")
+	consecutive_empty = 0
+	EMPTY_LIMIT = 3
 
-        # Long-poll for messages (WaitTimeSeconds=10 inside receive_and_parse)
-        batch = receive_and_parse(queue_url)
-        if not batch:
-            # Nothing visible yet — keep polling until all 21 arrive
-            continue
+	while len(by_order) < target_count:
+    	stats = get_queue_info(queue_url)
+    	logger.info(f"Queue snapshot before poll: {stats}")
+
+    	if stats["total"] == 0:
+        	consecutive_empty += 1
+    	else:
+        	consecutive_empty = 0
+
+    	batch = receive_and_parse(queue_url)
+    	if not batch:
+        	if consecutive_empty >= EMPTY_LIMIT:
+            	logger.info("Queue has been empty for several polls; exiting collect loop.")
+            	break
+        	continue
+
+    	consecutive_empty = 0  # we did receive
+
 
         # Filter out already-seen MessageIds (SQS redelivery defense)
         new_msgs = [m for m in batch if m["message_id"] not in seen_ids]
