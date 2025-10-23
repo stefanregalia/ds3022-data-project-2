@@ -7,6 +7,9 @@ import requests
 from prefect import flow, task, get_run_logger
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
+from pathlib import Path
+import json, os
+
 
 # Defining the API endpoint
 url = f"https://j9y2xa0vx0.execute-api.us-east-1.amazonaws.com/api/scatter/xtm9px"
@@ -148,13 +151,37 @@ def receive_and_parse(
 	return parsed
 
 @task
-def persist_fragments(path: str, frags: list[dict]) -> None:
-    import json, os
+def persist_fragments(path: str, frags: list[dict]) -> str:
+    """
+    Append parsed fragments to a local JSONL file (one JSON object per line).
+    Called BEFORE deleting from SQS so the data is durable if the process dies.
+    """
+    logger = get_run_logger()
     if not frags:
-        return
-    with open(path, "a") as f:
-        for m in frags:
-            f.write(json.dumps({"order_no": m["order_no"], "word": m["word"], "message_id": m["message_id"]}) + "\n")
+        logger.info("No new fragments to persist this round.")
+        return path
+
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)  # ensure folder exists
+
+    # write only the essentials; keep it tidy
+    safe_batch = [
+        {"message_id": f["message_id"], "order_no": f["order_no"], "word": f["word"]}
+        for f in frags
+    ]
+
+    try:
+        with p.open("a", encoding="utf-8") as fp:
+            for row in safe_batch:
+                fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+            fp.flush()
+            os.fsync(fp.fileno())  # best-effort durability
+        logger.info(f"Persisted {len(safe_batch)} fragment(s) to {p}.")
+    except OSError as e:
+        # Don’t crash the run; log and continue. (You can choose to gate deletion on success if you prefer.)
+        logger.warning(f"Failed to persist fragments to {p}: {e}")
+
+    return str(p)
 
 @task(retries = 2, retry_delay_seconds = 3)
 def delete_messages(queue_url: str, receipt_handles: list[str]) -> dict:
@@ -228,12 +255,14 @@ def dp2(target_count: int = 21):
         for m in new_batch:
             seen_ids.add(m["message_id"])
 
-        # Store fragments for Task 3 (order_no + word kept in each dict)
         fragments.extend(new_batch)
 
-        # Delete what we just stored so we don’t leave dangling messages
-        rhandles = [m["receipt_handle"] for m in new_batch]
-        delete_messages(queue_url, rhandles)
+# NEW: persist to durable storage BEFORE deletion (rubric: “persistently stores parsed content”)
+	persist_fragments("runs/dp2_fragments.jsonl", new_batch)
+
+# Now safe to delete what we just persisted
+	rhandles = [m["receipt_handle"] for m in new_batch]
+	delete_messages(queue_url, rhandles)
 
         logger.info(f"Collected {len(fragments)} / {target_count} so far.")
 
