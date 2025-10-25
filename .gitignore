@@ -1,0 +1,43 @@
+*.pem
+sds_key.pem
+SDS.pem
+dp2-project-key.pem
+
+# Data files (per rubric: no data files)
+runs/
+*.jsonl
+assembled_phrase.txt
+airflow_assembled_phrase.txt
+simple_test_results.jsonl
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Prefect
+.prefect/
