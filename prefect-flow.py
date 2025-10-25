@@ -127,7 +127,7 @@ def receive_and_parse(
 		
 		try:
 			attrs = m.get("MessageAttributes")
-			logger.info(f"📋 Message {msg_id[:8]}... attrs type: {type(attrs)}")  
+			logger.info(f"Message {msg_id[:8]}... attrs type: {type(attrs)}")  
 			
 			if attrs is None:
 				logger.warning(f"Message {msg_id} has MessageAttributes = None")
