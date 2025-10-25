@@ -370,7 +370,7 @@ def collection_loop_task(**context):
             seen_ids.add(m["message_id"])
         
         # Persist fragments to file before deletion
-        persist_fragments_task(new_msgs)
+        # persist_fragments_task(new_msgs)
         
         # Add new fragments to collection, keeping only first occurrence of each order_no
         added = 0
@@ -433,8 +433,7 @@ def assemble_and_submit_task(**context):
         fp.write(phrase + "\n")
     print(f"Saved preview -> airflow_assembled_phrase.txt")
     
-    # Dry run flag - change to False when ready to submit
-    dry_run = True  # Change to False to actually submit
+    dry_run = False
     
     if dry_run:
         print("Dry run enabled: skipping submission to dp2-submit.")
