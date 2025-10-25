@@ -226,7 +226,7 @@ def receive_and_parse_task(**context):
     print(f"Parsed {len(parsed)} valid fragment(s) from {len(messages)} received.")
     return parsed
 
-def persist_fragments_task(fragments: List[Dict], path: str = "runs/airflow_fragments.jsonl"):
+def persist_fragments_task(fragments: List[Dict], path: str = "/tmp/airflow_fragments.jsonl"):
     """
     Persist fragments to local JSONL file before deleting from queue.
     Ensures data durability in case process fails during deletion.
