@@ -1,5 +1,3 @@
-# Changed the name of the prefect file because of import/name overlap issues
-
 # Importing dependencies
 
 from __future__ import annotations
@@ -10,6 +8,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from pathlib import Path
 import json, os
 from typing import List, Dict
+
 
 # Defining the API endpoint
 url = f"https://j9y2xa0vx0.execute-api.us-east-1.amazonaws.com/api/scatter/xtm9px"
@@ -343,27 +342,7 @@ def assemble_and_submit_fast(
     logger.info("✅ Submission accepted (HTTP 200).")
     return phrase
 
-    # --- submit once ---
-    sqs = sqs_client()
-    resp = sqs.send_message(
-        QueueUrl=submit_queue_url,
-        MessageBody=phrase,
-        MessageAttributes={
-            "uvaid":   {"DataType": "String", "StringValue": uvaid},
-            "phrase":  {"DataType": "String", "StringValue": phrase},
-            "platform":{"DataType": "String", "StringValue": platform},
-        },
-    )
-    status = resp.get("ResponseMetadata", {}).get("HTTPStatusCode")
-    if status != 200:
-        raise RuntimeError(f"Submission failed (status {status}): {resp}")
-    logger.info("✅ Submission accepted (HTTP 200).")
-    return phrase
-
-
 # Defining our flow order to execute our tasks
-import time
-
 @flow
 def dp2(target_count: int = 21):
     logger = get_run_logger()
