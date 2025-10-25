@@ -42,7 +42,7 @@ def get_queue_info_task() -> Dict[str, int]:
     """
     context = get_current_context()
     log = context["ti"].log
-    queue_url = context["ti"].xcom_pull(key="queue_url")
+    queue_url = context["ti"].xcom_pull(task_ids="scatter_api", key="queue_url")
     sqs = sqs_client()
 
     try:
@@ -77,7 +77,7 @@ def receive_and_parse_task() -> List[Dict]:
     """
     context = get_current_context()
     log = context["ti"].log
-    queue_url = context["ti"].xcom_pull(key="queue_url")
+    queue_url = context["ti"].xcom_pull(task_ids="scatter_api", key="queue_url")
     sqs = sqs_client()
 
     try:
@@ -180,7 +180,7 @@ def delete_messages_task(receipt_handles: List[str]) -> Dict[str, int]:
     """
     context = get_current_context()
     log = context["ti"].log
-    queue_url = context["ti"].xcom_pull(key="queue_url")
+    queue_url = context["ti"].xcom_pull(task_ids="scatter_api", key="queue_url")
     sqs = sqs_client()
 
     if not receipt_handles:
@@ -246,7 +246,7 @@ def collection_loop_task() -> List[Dict]:
     """
     context = get_current_context()
     log = context["ti"].log
-    context["ti"].xcom_pull(key="queue_url")
+    queue_url = context["ti"].xcom_pull(task_ids="scatter_api", key="queue_url")
     by_order: Dict[int, Dict] = {}
     seen_ids = set()
     CONSECUTIVE_EMPTY_LIMIT = 5
@@ -311,7 +311,7 @@ def assemble_and_submit_task() -> str:
     """
     context = get_current_context()
     log = context["ti"].log
-    fragments: List[Dict] = context["ti"].xcom_pull(key="fragments")
+    fragments: List[Dict] = context["ti"].xcom_pull(task_ids="collection_loop", key="fragments")
 
     if not fragments or len(fragments) != TARGET_COUNT:
         raise RuntimeError(f"Expected {TARGET_COUNT} fragments; got {0 if not fragments else len(fragments)}")
