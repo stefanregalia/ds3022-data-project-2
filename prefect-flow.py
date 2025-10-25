@@ -475,7 +475,7 @@ def dp2(target_count: int = 21):
         # We received messages, so reset the stall counter
         consecutive_empty = 0
         
-        # Filter out any messages we've already seen (defense against SQS redelivery)
+        # Filter out any messages we've already seen 
         new_msgs = [m for m in batch if m["message_id"] not in seen_ids]
         # Add new message IDs to our tracking set
         for m in new_msgs:
@@ -510,10 +510,10 @@ def dp2(target_count: int = 21):
     # Validate, assemble, and submit the final phrase
     final_phrase = assemble_and_submit_fast(
         fragments,
-        uvaid="xtm9px",              # UVA computing ID
-        platform="prefect",          # Workflow platform for submission
+        uvaid="xtm9px",    
+        platform="prefect",         
         expected_count=target_count,
-        dry_run=True,  # set to False when you're ready to actually submit
+        dry_run=False, 
     )
     
     return final_phrase
