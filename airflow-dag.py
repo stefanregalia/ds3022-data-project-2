@@ -11,8 +11,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 import pendulum
 from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.decorators import get_current_context
+from airflow.operators.python import PythonOperator, get_current_context
 
 
 default_args = {
