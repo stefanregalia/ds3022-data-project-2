@@ -1,21 +1,24 @@
-# airflow-dag.py
+from __future__ import annotations
 
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago
 from datetime import timedelta
+from pathlib import Path
+from typing import List, Dict
+import json
+import os
 import requests
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
-from pathlib import Path
-import json
-import os
-from typing import List, Dict
+
+import pendulum
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.decorators import get_current_context
+
 
 default_args = {
     "owner": "airflow",
     "depends_on_past": False,
-    "start_date": days_ago(1),
+    "start_date": pendulum.datetime(2025, 10, 24, tz="UTC"),
     "email_on_failure": False,
     "email_on_retry": False,
     "retries": 2,  # overridden to 0 on the scatter task to ensure a single POST
@@ -25,42 +28,22 @@ default_args = {
 API_URL = "https://j9y2xa0vx0.execute-api.us-east-1.amazonaws.com/api/scatter/xtm9px"
 INSTRUCTOR_QUEUE_URL = "https://sqs.us-east-1.amazonaws.com/440848399208/dp2-submit"
 UVAID = "xtm9px"
-TARGET_COUNT = 21  
+TARGET_COUNT = 21
 PERSIST_PATH = "/tmp/airflow_fragments.jsonl"
+
 
 def sqs_client(region: str = "us-east-1"):
     """Create and return a boto3 SQS client for the specified region."""
     return boto3.client("sqs", region_name=region)
 
-def scatter_task(**context):
-    """
-    Call the scatter API once to populate the student's queue with 21 messages.
-    Pushes the queue URL to XCom for downstream tasks.
-    """
-    log = context["task_instance"].log
-    log.info("Calling the scatter API endpoint for %s", UVAID)
 
-    try:
-        r = requests.post(API_URL, timeout=20)
-        r.raise_for_status()
-    except requests.RequestException as e:
-        log.exception("Scatter API request failed: %s", e)
-        raise
-
-    payload = r.json()
-    queue_url = payload["sqs_url"]
-    log.info("Queue URL received: %s", queue_url)
-
-    context["task_instance"].xcom_push(key="queue_url", value=queue_url)
-    return queue_url
-
-
-def get_queue_info_task(**context):
+def get_queue_info_task() -> Dict[str, int]:
     """
     Return queue counts for visible, in-flight, delayed messages (diagnostics).
     """
-    log = context["task_instance"].log
-    queue_url = context["task_instance"].xcom_pull(key="queue_url")
+    context = get_current_context()
+    log = context["ti"].log
+    queue_url = context["ti"].xcom_pull(key="queue_url")
     sqs = sqs_client()
 
     try:
@@ -78,20 +61,24 @@ def get_queue_info_task(**context):
         delayed = int(attrs.get("ApproximateNumberOfMessagesDelayed", 0))
         total = visible + not_visible + delayed
         stats = {"visible": visible, "not_visible": not_visible, "delayed": delayed, "total": total}
-        log.info("Queue counts | visible=%d not_visible=%d delayed=%d total=%d", visible, not_visible, delayed, total)
+        log.info(
+            "Queue counts | visible=%d not_visible=%d delayed=%d total=%d",
+            visible, not_visible, delayed, total
+        )
         return stats
     except (BotoCoreError, ClientError) as e:
         log.exception("Failed to get queue attributes: %s", e)
         return {"visible": 0, "not_visible": 0, "delayed": 0, "total": 0}
 
 
-def receive_and_parse_task(**context):
+def receive_and_parse_task() -> List[Dict]:
     """
     Long-poll the SQS queue for up to 10 messages and parse MessageAttributes
     into {message_id, order_no, word, receipt_handle}.
     """
-    log = context["task_instance"].log
-    queue_url = context["task_instance"].xcom_pull(key="queue_url")
+    context = get_current_context()
+    log = context["ti"].log
+    queue_url = context["ti"].xcom_pull(key="queue_url")
     sqs = sqs_client()
 
     try:
@@ -117,7 +104,6 @@ def receive_and_parse_task(**context):
         msg_id = m.get("MessageId", "UNKNOWN")
         try:
             attrs = m.get("MessageAttributes")
-
             if attrs is None or not isinstance(attrs, dict):
                 log.warning("Message %s has invalid MessageAttributes: %r", msg_id, attrs)
                 continue
@@ -160,11 +146,13 @@ def receive_and_parse_task(**context):
     return parsed
 
 
-def persist_fragments_task(fragments: List[Dict], path: str = PERSIST_PATH, **context):
+def persist_fragments_task(fragments: List[Dict], path: str = PERSIST_PATH) -> str:
     """
     Persist a batch of parsed fragments to a JSONL file for durability before deletion.
     """
-    log = context["task_instance"].log
+    context = get_current_context()
+    log = context["ti"].log
+
     if not fragments:
         log.info("No new fragments to persist this round.")
         return path
@@ -187,12 +175,13 @@ def persist_fragments_task(fragments: List[Dict], path: str = PERSIST_PATH, **co
     return str(p)
 
 
-def delete_messages_task(receipt_handles: List[str], **context):
+def delete_messages_task(receipt_handles: List[str]) -> Dict[str, int]:
     """
     Delete messages from SQS in batches of 10. Return counts of deleted/failed.
     """
-    log = context["task_instance"].log
-    queue_url = context["task_instance"].xcom_pull(key="queue_url")
+    context = get_current_context()
+    log = context["ti"].log
+    queue_url = context["ti"].xcom_pull(key="queue_url")
     sqs = sqs_client()
 
     if not receipt_handles:
@@ -201,7 +190,7 @@ def delete_messages_task(receipt_handles: List[str], **context):
 
     def _chunks(lst, n):
         for i in range(0, len(lst), n):
-            yield lst[i : i + n]
+            yield lst[i: i + n]
 
     total_deleted = 0
     total_failed = 0
@@ -227,14 +216,38 @@ def delete_messages_task(receipt_handles: List[str], **context):
     log.info("Deleted %d message(s); %d failed to delete.", total_deleted, total_failed)
     return {"deleted": total_deleted, "failed": total_failed}
 
+def scatter_task() -> str:
+    """
+    Call the scatter API once to populate the student's queue with 21 messages.
+    Pushes the queue URL to XCom for downstream tasks.
+    """
+    context = get_current_context()
+    log = context["ti"].log
+    log.info("Calling the scatter API endpoint for %s", UVAID)
 
-def collection_loop_task(**context):
+    try:
+        r = requests.post(API_URL, timeout=20)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        log.exception("Scatter API request failed: %s", e)
+        raise
+
+    payload = r.json()
+    queue_url = payload["sqs_url"]
+    log.info("Queue URL received: %s", queue_url)
+
+    context["ti"].xcom_push(key="queue_url", value=queue_url)
+    return queue_url
+
+
+def collection_loop_task() -> List[Dict]:
     """
     Orchestrate queue monitoring, collection, persistence, and deletion
     until all 21 unique fragments (order_no 1..21) are collected.
     """
-    log = context["task_instance"].log
-    context["task_instance"].xcom_pull(key="queue_url")
+    context = get_current_context()
+    log = context["ti"].log
+    context["ti"].xcom_pull(key="queue_url")
     by_order: Dict[int, Dict] = {}
     seen_ids = set()
     CONSECUTIVE_EMPTY_LIMIT = 5
@@ -243,10 +256,10 @@ def collection_loop_task(**context):
     log.info("Starting collection loop; aiming for %d unique fragments (order_no 1..21).", TARGET_COUNT)
 
     while len(by_order) < TARGET_COUNT:
-        stats = get_queue_info_task(**context)
+        stats = get_queue_info_task()
         log.info("Queue snapshot before poll: %s", stats)
 
-        batch = receive_and_parse_task(**context)
+        batch = receive_and_parse_task()
 
         if not batch:
             if stats["visible"] == 0 and stats["not_visible"] == 0 and stats["delayed"] == 0:
@@ -270,8 +283,8 @@ def collection_loop_task(**context):
         for m in new_msgs:
             seen_ids.add(m["message_id"])
 
-        # Persist before deletion 
-        persist_fragments_task(new_msgs, **context)
+        # Persist before deletion
+        persist_fragments_task(new_msgs)
 
         # Keep first occurrence for each order_no
         added = 0
@@ -281,29 +294,31 @@ def collection_loop_task(**context):
                 by_order[o] = m
                 added += 1
 
-        delete_messages_task([m["receipt_handle"] for m in batch], **context)
+        delete_messages_task([m["receipt_handle"] for m in batch])
 
         if added:
             log.info("Collected %d unique / %d required. (+%d this round)", len(by_order), TARGET_COUNT, added)
 
     log.info("Collected all required fragments.")
-    context["task_instance"].xcom_push(key="fragments", value=list(by_order.values()))
-    return list(by_order.values())
+    fragments = list(by_order.values())
+    context["ti"].xcom_push(key="fragments", value=fragments)
+    return fragments
 
 
-def assemble_and_submit_task(**context):
+def assemble_and_submit_task() -> str:
     """
     Validate fragments, assemble the phrase in order, and submit it
     to the instructor queue with platform="airflow".
     """
-    log = context["task_instance"].log
-    fragments: List[Dict] = context["task_instance"].xcom_pull(key="fragments")
+    context = get_current_context()
+    log = context["ti"].log
+    fragments: List[Dict] = context["ti"].xcom_pull(key="fragments")
 
     if not fragments or len(fragments) != TARGET_COUNT:
         raise RuntimeError(f"Expected {TARGET_COUNT} fragments; got {0 if not fragments else len(fragments)}")
 
     order_nos = [int(f["order_no"]) for f in fragments]
-    words = [f["word"] for f in fragments]
+    words = [f["word"] for f in fragments]  # noqa: F841
 
     dupes = [n for n in set(order_nos) if order_nos.count(n) > 1]
     if dupes:
@@ -321,7 +336,7 @@ def assemble_and_submit_task(**context):
     phrase = " ".join(ordered).strip()
     log.info("ASSEMBLED PHRASE (%d words): %s", len(ordered), phrase)
 
-    with open("airflow_assembled_phrase.txt", "w") as fp:
+    with open("airflow_assembled_phrase.txt", "w", encoding="utf-8") as fp:
         fp.write(phrase + "\n")
     log.info("Saved preview -> airflow_assembled_phrase.txt")
 
@@ -344,12 +359,13 @@ def assemble_and_submit_task(**context):
     return phrase
 
 
+# DAG
 
 with DAG(
     dag_id="dp2_quote_assembler",
     default_args=default_args,
     description="DP2 Quote Assembler - Airflow Version",
-    schedule_interval=None,  
+    schedule=None,        # Airflow 3 preferred; schedule_interval=None also fine
     catchup=False,
     tags=["dp2", "sqs", "quote-assembler"],
 ) as dag:
@@ -357,20 +373,18 @@ with DAG(
     scatter = PythonOperator(
         task_id="scatter_api",
         python_callable=scatter_task,
-        provide_context=True,
-        retries=0,  
+        retries=0,  # call the POST exactly once
     )
 
     collect = PythonOperator(
         task_id="collection_loop",
         python_callable=collection_loop_task,
-        provide_context=True,
     )
 
     assemble = PythonOperator(
         task_id="assemble_and_submit",
         python_callable=assemble_and_submit_task,
-        provide_context=True,
     )
 
     scatter >> collect >> assemble
+
