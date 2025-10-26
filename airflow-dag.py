@@ -296,91 +296,120 @@ def dp2_quote_assembler():
         return phrase
 
     @task(retries=0)
-    def collect_all(queue_url: str) -> List[Dict]:
-        """
-        Main collection loop (single task to keep the DAG graph sane).
-        I track unique fragments by order_no and delete everything I touch.
-        I stop when I have the full set or the attribute-based timeout fires.
-        """
-        by_order: dict[int, Dict] = {}
-        seen_ids: set[str] = set()
+def collect_all(queue_url: str) -> List[Dict]:
+    """
+    Main collection loop implemented directly (no cross-task calls).
+    Tracks unique fragments by order_no, deletes everything it receives,
+    stops when all fragments are collected or a timeout/stall occurs.
+    """
+    sqs = sqs_client()
 
-        t_start = time.time()
-        consecutive_empty = 0
-        CONSECUTIVE_EMPTY_LIMIT = 5
-
-        while len(by_order) < TOTAL_MESSAGES_EXPECTED:
-            # Snap attributes to know what's going on before the poll
-            stats = get_queue_info.expand(queue_url=[queue_url])[0]  # call the task inline once
-            print(f"[{now_utc_ts()}] Snapshot: {stats}")
-
-            batch = receive_and_parse.expand(queue_url=[queue_url])[0]
-            # .expand returns a list result; since we pass one element, pull the first
-            if not isinstance(batch, list):
-                batch = []
-
-            if not batch:
-                # No messages this poll — either delayed, in-flight, or actually empty
-                if stats["visible"] == 0 and stats["not_visible"] == 0 and stats["delayed"] == 0:
-                    consecutive_empty += 1
-                    print(f"[{now_utc_ts()}] Empty snapshot {consecutive_empty}/{CONSECUTIVE_EMPTY_LIMIT}")
-                    if consecutive_empty >= CONSECUTIVE_EMPTY_LIMIT:
-                        have = sorted(by_order.keys())
-                        missing = []
-                        if have:
-                            mn = min(have)
-                            required = set(range(mn, mn + TOTAL_MESSAGES_EXPECTED))
-                            missing = sorted(required - set(have))
-                        else:
-                            missing = list(range(1, TOTAL_MESSAGES_EXPECTED + 1))
-                        raise AirflowFailException(
-                            f"Stall: queue empty for {CONSECUTIVE_EMPTY_LIMIT} consecutive polls "
-                            f"but collected {len(by_order)}/{TOTAL_MESSAGES_EXPECTED}. Missing: {missing}"
-                        )
-                else:
-                    consecutive_empty = 0  # there is life in the queue; just not visible to me yet
-
-                # Also guard on overall timeout tied to the delayed range
-                if time.time() - t_start > ATTR_POLL_TIMEOUT_SEC:
-                    have = sorted(by_order.keys())
-                    raise AirflowFailException(
-                        f"Timeout after {ATTR_POLL_TIMEOUT_SEC}s with {len(by_order)}/{TOTAL_MESSAGES_EXPECTED} collected. "
-                        f"Have orders: {have}"
-                    )
-
-                # Short breath between polls so I’m not hammering the API
-                time.sleep(ATTR_POLL_INTERVAL_SEC)
-                continue
-
-            # Reset empty counter on any receipt
-            consecutive_empty = 0
-
-            # Only new messages by MessageId
-            new_msgs = [m for m in batch if m["message_id"] not in seen_ids]
-            for m in new_msgs:
-                seen_ids.add(m["message_id"])
-
-            # Persist what I got before deletion (artifact)
-            persist_fragments.expand(frags=[new_msgs])
-
-            # Keep first occurrence per order_no
-            added = 0
-            for m in new_msgs:
-                o = m["order_no"]
-                if o not in by_order:
-                    by_order[o] = m
-                    added += 1
-
-            # Delete everything I received this poll (including duplicates I didn’t keep)
-            delete_messages.expand(
-                queue_url=[queue_url],
-                receipt_handles=[[m["receipt_handle"] for m in batch]],
+    def snapshot_counts(qurl: str) -> dict:
+        try:
+            resp = sqs.get_queue_attributes(
+                QueueUrl=qurl,
+                AttributeNames=[
+                    "ApproximateNumberOfMessages",
+                    "ApproximateNumberOfMessagesNotVisible",
+                    "ApproximateNumberOfMessagesDelayed",
+                ],
             )
+            attrs = resp.get("Attributes", {})
+            visible = int(attrs.get("ApproximateNumberOfMessages", 0))
+            not_visible = int(attrs.get("ApproximateNumberOfMessagesNotVisible", 0))
+            delayed = int(attrs.get("ApproximateNumberOfMessagesDelayed", 0))
+            total = visible + not_visible + delayed
+            print(f"[{now_utc_ts()}] Snapshot | visible={visible} not_visible={not_visible} delayed={delayed} total={total}")
+            return {"visible": visible, "not_visible": not_visible, "delayed": delayed, "total": total}
+        except (BotoCoreError, ClientError) as e:
+            print(f"[{now_utc_ts()}] Snapshot failed: {e}")
+            return {"visible": 0, "not_visible": 0, "delayed": 0, "total": 0}
 
-            if added:
-                print(f"[{now_utc_ts()}] Progress: {len(by_order)} unique / {TOTAL_MESSAGES_EXPECTED} (+{added})")
+    def receive_once(qurl: str) -> List[Dict]:
+        try:
+            resp = sqs.receive_message(
+                QueueUrl=qurl,
+                MaxNumberOfMessages=RECEIVE_MAX_MSGS,
+                WaitTimeSeconds=RECEIVE_WAIT_TIME_SEC,
+                MessageAttributeNames=["All"],
+            )
+        except (BotoCoreError, ClientError) as e:
+            print(f"[{now_utc_ts()}] receive_message failed: {e}")
+            return []
+        messages = resp.get("Messages", [])
+        if not messages:
+            print(f"[{now_utc_ts()}] No messages on this poll.")
+            return []
+        out: List[Dict] = []
+        for m in messages:
+            msg_id = m.get("MessageId", "UNKNOWN")
+            attrs = m.get("MessageAttributes", {})
+            rh = m.get("ReceiptHandle")
+            order_attr = attrs.get("order_no")
+            word_attr = attrs.get("word")
+            if not rh or not isinstance(attrs, dict) or order_attr is None or word_attr is None:
+                print(f"[{now_utc_ts()}] Skipping malformed {msg_id}")
+                continue
+            raw_order = order_attr.get("StringValue") if isinstance(order_attr, dict) else order_attr
+            word = word_attr.get("StringValue") if isinstance(word_attr, dict) else word_attr
+            try:
+                order_no = int(raw_order)
+            except (ValueError, TypeError):
+                print(f"[{now_utc_ts()}] Non-integer order_no in {msg_id}: {raw_order}")
+                continue
+            out.append({"message_id": msg_id, "order_no": order_no, "word": word, "receipt_handle": rh})
+        print(f"[{now_utc_ts()}] Parsed {len(out)} valid fragment(s) this poll.")
+        return out
 
-            # Guard on overall timeout
+    def delete_receipts(qurl: str, receipt_handles: List[str]) -> None:
+        if not receipt_handles:
+            return
+        def chunks(lst, n):
+            for i in range(0, len(lst), n):
+                yield lst[i:i+n]
+        for batch in chunks(receipt_handles, 10):
+            entries = [{"Id": str(i), "ReceiptHandle": rh} for i, rh in enumerate(batch)]
+            try:
+                resp = sqs.delete_message_batch(QueueUrl=qurl, Entries=entries)
+            except (BotoCoreError, ClientError) as e:
+                print(f"[{now_utc_ts()}] delete_message_batch failed: {e}")
+                continue
+            failed = resp.get("Failed", [])
+            if failed:
+                print(f"[{now_utc_ts()}] Partial delete failure: {[f.get('Id') for f in failed]}")
+
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    by_order: dict[int, Dict] = {}
+    seen_ids: set[str] = set()
+
+    t_start = time.time()
+    consecutive_empty = 0
+    CONSECUTIVE_EMPTY_LIMIT = 5
+
+    while len(by_order) < TOTAL_MESSAGES_EXPECTED:
+        stats = snapshot_counts(queue_url)
+
+        batch = receive_once(queue_url)
+
+        if not batch:
+            if stats["visible"] == 0 and stats["not_visible"] == 0 and stats["delayed"] == 0:
+                consecutive_empty += 1
+                print(f"[{now_utc_ts()}] Empty snapshot {consecutive_empty}/{CONSECUTIVE_EMPTY_LIMIT}")
+                if consecutive_empty >= CONSECUTIVE_EMPTY_LIMIT:
+                    have = sorted(by_order.keys())
+                    if have:
+                        mn = min(have)
+                        required = set(range(mn, mn + TOTAL_MESSAGES_EXPECTED))
+                        missing = sorted(required - set(have))
+                    else:
+                        missing = list(range(1, TOTAL_MESSAGES_EXPECTED + 1))
+                    raise AirflowFailException(
+                        f"Stall: queue empty for {CONSECUTIVE_EMPTY_LIMIT} consecutive polls "
+                        f"but collected {len(by_order)}/{TOTAL_MESSAGES_EXPECTED}. Missing: {missing}"
+                    )
+            else:
+                consecutive_empty = 0
+
             if time.time() - t_start > ATTR_POLL_TIMEOUT_SEC:
                 have = sorted(by_order.keys())
                 raise AirflowFailException(
@@ -388,8 +417,53 @@ def dp2_quote_assembler():
                     f"Have orders: {have}"
                 )
 
-        print(f"[{now_utc_ts()}] Collected all {TOTAL_MESSAGES_EXPECTED} fragments.")
-        return list(by_order.values())
+            time.sleep(ATTR_POLL_INTERVAL_SEC)
+            continue
+
+        consecutive_empty = 0
+
+        # persist before delete
+        safe_batch = [
+            {"message_id": f["message_id"], "order_no": f["order_no"], "word": f["word"]}
+            for f in batch if f["message_id"] not in seen_ids
+        ]
+        if safe_batch:
+            path = RUNS_DIR / "dp2_fragments.jsonl"
+            try:
+                with path.open("a", encoding="utf-8") as fp:
+                    for row in safe_batch:
+                        fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    fp.flush()
+                    os.fsync(fp.fileno())
+                print(f"[{now_utc_ts()}] Persisted {len(safe_batch)} fragment(s) -> {path}")
+            except OSError as e:
+                print(f"[{now_utc_ts()}] Persist error: {e}")
+
+        # update collections
+        added = 0
+        for m in batch:
+            if m["message_id"] not in seen_ids:
+                seen_ids.add(m["message_id"])
+                if m["order_no"] not in by_order:
+                    by_order[m["order_no"]] = m
+                    added += 1
+
+        # delete everything received
+        delete_receipts(queue_url, [m["receipt_handle"] for m in batch])
+
+        if added:
+            print(f"[{now_utc_ts()}] Progress: {len(by_order)} unique / {TOTAL_MESSAGES_EXPECTED} (+{added})")
+
+        if time.time() - t_start > ATTR_POLL_TIMEOUT_SEC:
+            have = sorted(by_order.keys())
+            raise AirflowFailException(
+                f"Timeout after {ATTR_POLL_TIMEOUT_SEC}s with {len(by_order)}/{TOTAL_MESSAGES_EXPECTED} collected. "
+                f"Have orders: {have}"
+            )
+
+    print(f"[{now_utc_ts()}] Collected all {TOTAL_MESSAGES_EXPECTED} fragments.")
+    return list(by_order.values())
+
 
     # --- Orchestration: scatter -> collect_all -> assemble_and_submit_fast ---
     qurl = scatter()
