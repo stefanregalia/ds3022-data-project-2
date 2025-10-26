@@ -1,11 +1,4 @@
-# airflow.py
-# DP2 Quote Assembler — Airflow version
-# Exact steps:
-#  1) POST once to scatter 21 delayed messages into my SQS queue (uses my UVA ID)
-#  2) Monitor queue attributes (visible / not_visible / delayed) instead of blind sleeping
-#  3) Long-poll, parse MessageAttributes (order_no, word), persist a breadcrumb, delete everything I receive
-#  4) Validate: no duplicates, none missing, strict increasing order
-#  5) Submit assembled phrase to dp2-submit with required attributes (uvaid, phrase, platform="airflow") and verify HTTP 200
+# Importing dependencies
 
 from __future__ import annotations
 
@@ -23,19 +16,17 @@ import requests
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowFailException
 
-# --------------------------
-# CONFIG — edit these two
-# --------------------------
-UVA_ID = "xtm9px"  # replace with *my* UVA ID before committing if needed
+
+UVA_ID = "xtm9px" 
 PLATFORM = "airflow"
 SCATTER_ENDPOINT = f"https://j9y2xa0vx0.execute-api.us-east-1.amazonaws.com/api/scatter/{UVA_ID}"
 SUBMIT_QUEUE_URL = "https://sqs.us-east-1.amazonaws.com/440848399208/dp2-submit"
 AWS_REGION = "us-east-1"
 
-# Behavior knobs (keep aligned with Prefect)
+# Behavior knobs 
 TOTAL_MESSAGES_EXPECTED = 21
-ATTR_POLL_INTERVAL_SEC = 5          # how often I check attributes between empty polls
-ATTR_POLL_TIMEOUT_SEC = 16 * 60     # hard stop (delays up to 900s, so this comfortably covers it)
+ATTR_POLL_INTERVAL_SEC = 5          # how often to check attributes between empty polls
+ATTR_POLL_TIMEOUT_SEC = 16 * 60     # hard stop if delayes go past 900s for any reason
 RECEIVE_WAIT_TIME_SEC = 10          # SQS long-poll time per call
 RECEIVE_MAX_MSGS = 10               # SQS max per receive
 RUNS_DIR = Path(__file__).resolve().parent / "runs"  # local artifacts live under dags/runs
@@ -49,26 +40,26 @@ def now_utc_ts() -> str:
 default_args = {
     "owner": "me",
     "depends_on_past": False,
-    "retries": 2,  # light global retries; inner tasks also manage their own
+    "retries": 2,  # light global retries
     "retry_delay": timedelta(seconds=3),
 }
 
 @dag(
     dag_id="dp2_quote_assembler",
     start_date=datetime(2025, 10, 1),
-    schedule=None,  # I can switch to cron later if I want a schedule
+    schedule=None,  
     catchup=False,
     default_args=default_args,
     tags=["dp2", "sqs", "uvasds"],
 )
 def dp2_quote_assembler():
-    # --- Tasks (TaskFlow API) ---
-
+    # Tasks
+    
     @task(retries=0)
     def scatter() -> str:
         """
         POST once per DAG run to populate my SQS queue with exactly 21 delayed messages.
-        Returns my queue URL. Not called again mid-run — prevents re-seeding.
+        Returns my queue URL. Not called again mid-run.
         """
         r = requests.post(SCATTER_ENDPOINT, timeout=20)
         r.raise_for_status()
@@ -207,7 +198,7 @@ def dp2_quote_assembler():
             batch = receive_once(queue_url)
 
             if not batch:
-                # No messages right now — could be delayed or in-flight
+                # No messages right now. Could be delayed or in-flight
                 if stats["visible"] == 0 and stats["not_visible"] == 0 and stats["delayed"] == 0:
                     consecutive_empty += 1
                     print(f"[{now_utc_ts()}] Empty snapshot {consecutive_empty}/{CONSECUTIVE_EMPTY_LIMIT}")
@@ -224,10 +215,10 @@ def dp2_quote_assembler():
                             f"but collected {len(by_order)}/{TOTAL_MESSAGES_EXPECTED}. Missing: {missing}"
                         )
                 else:
-                    # There is life in the queue; reset the empty counter
+                    
                     consecutive_empty = 0
 
-                # Global timeout guard — don't loop forever
+                # Global timeout guard (To stop forever looping errors)
                 if time.time() - t_start > ATTR_POLL_TIMEOUT_SEC:
                     have = sorted(by_order.keys())
                     raise AirflowFailException(
@@ -238,10 +229,10 @@ def dp2_quote_assembler():
                 time.sleep(ATTR_POLL_INTERVAL_SEC)
                 continue
 
-            # We received messages this poll → reset empties
+            # We received messages in this poll
             consecutive_empty = 0
 
-            # Persist before delete (only new MessageIds)
+            # Persist before delete (only new MessageIDs)
             safe_batch = [
                 {"message_id": f["message_id"], "order_no": f["order_no"], "word": f["word"]}
                 for f in batch if f["message_id"] not in seen_ids
@@ -287,7 +278,7 @@ def dp2_quote_assembler():
     @task(retries=2, retry_delay=timedelta(seconds=3))
     def assemble_and_submit_fast(fragments: List[Dict]) -> str:
         """
-        Validate → assemble → submit with attributes and verify HTTP 200.
+        Validate, assemble, submit with attributes and verify HTTP 200.
         Strict checks: duplicates, missing, non-empty words, strictly increasing order_no.
         """
         if not fragments:
@@ -322,7 +313,7 @@ def dp2_quote_assembler():
         phrase = " ".join(f["word"] for f in ordered).strip()
         print(f"[{now_utc_ts()}] ASSEMBLED PHRASE ({len(ordered)} words): {phrase}")
 
-        # Optional preview artifact
+      
         try:
             preview = RUNS_DIR / "assembled_phrase_airflow.txt"
             RUNS_DIR.mkdir(parents=True, exist_ok=True)
@@ -350,7 +341,7 @@ def dp2_quote_assembler():
         print(f"[{now_utc_ts()}] Submission accepted (HTTP 200).")
         return phrase
 
-    # --- Orchestration: scatter -> collect_all -> assemble_and_submit_fast ---
+    # scatter -> collect_all -> assemble_and_submit_fast 
     qurl = scatter()
     frags = collect_all(qurl)
     phrase = assemble_and_submit_fast(frags)
