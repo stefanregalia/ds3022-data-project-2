@@ -1,7 +1,6 @@
+# Keys & Secrets
 *.pem
-sds_key.pem
-SDS.pem
-dp2-project-key.pem
+.aws.env
 
 # Data files (per rubric: no data files)
 runs/
@@ -41,4 +40,4 @@ Thumbs.db
 
 # Prefect
 .prefect/
-.aws.env
+
