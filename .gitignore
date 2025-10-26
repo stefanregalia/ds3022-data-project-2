@@ -1,8 +1,9 @@
-# Keys & Secrets
+# Keys and Secrets
+
 *.pem
 .aws.env
 
-# Data files (per rubric: no data files)
+# Data files 
 runs/
 *.jsonl
 assembled_phrase.txt
